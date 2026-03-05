@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.build_script_queue.json
+.build_script_audit.log
+.build_script_config.json
+node_modules/
+*.bak
+tools.bak/
