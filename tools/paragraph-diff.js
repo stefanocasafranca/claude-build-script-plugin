@@ -246,6 +246,11 @@ function extractParagraph(buildScriptContent) {
       const trimmed = line.trim();
       if (!trimmed) continue;
 
+      // Also stop at known section labels that appear as plain text (Google Docs read-back
+      // strips ## markers, so these headings arrive without markdown formatting)
+      const PLAIN_TEXT_STOPS = /^(How to Run|Tech Stack|Key Files|Project Name|Features|Commands|Overview|Getting Started|Project)\b/i;
+      if (PLAIN_TEXT_STOPS.test(trimmed)) break;
+
       // Handle old enumerated format: strip numbering, skip strikethrough
       if (/^\d+\.\s/.test(trimmed) || /^-\s/.test(trimmed)) {
         let cleaned = trimmed.replace(/^\d+\.\s*/, '').replace(/^-\s*/, '');
@@ -294,6 +299,22 @@ function migrateToParapraph(buildScriptContent) {
 // ---------------------------------------------------------------------------
 
 /**
+ * v16.0: Format a diff result into the ADD:/CHANGED:/REMOVED: comment annotation
+ * used in BUILD_SCRIPT_FULL.md "Prompts RAW" entries.
+ *
+ * Returns a pipe-separated string, e.g.:
+ *   'ADD: "sentence" | CHANGED: "old" → "new" | REMOVED: "sentence"'
+ * Returns empty string if no changes.
+ */
+function formatComment(diff) {
+  const parts = [];
+  for (const s of diff.added)    parts.push(`ADD: "${s}"`);
+  for (const m of diff.modified) parts.push(`CHANGED: "${m.old}" → "${m.new}"`);
+  for (const s of diff.removed)  parts.push(`REMOVED: "${s}"`);
+  return parts.join(' | ');
+}
+
+/**
  * Format a diff result into a readable string suitable for prompt injection.
  */
 function formatDiffDetail(diff) {
@@ -322,5 +343,6 @@ module.exports = {
   extractParagraph,
   migrateToParapraph,
   formatDiffDetail,
+  formatComment,
   similarity,
 };

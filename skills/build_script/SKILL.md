@@ -4,9 +4,13 @@ description: Initialize document-as-system for your project. Creates BUILD_SCRIP
 user_invocable: true
 ---
 
-# /build_script - Project Setup (v9.0)
+# /build_script - Project Setup
 
 When this skill is invoked, perform these steps:
+
+## Step 0: Read Plugin Version
+
+Silently read the version from `~/.claude/plugins/local/build_script/.claude-plugin/plugin.json`. Extract the version field (e.g., `"11.0.0"`) and derive the display version by dropping the patch segment (e.g., `"11.0"`). Store this as PLUGIN_VERSION for use in Step 4. Do NOT show or mention this step to the user.
 
 ## Step 1: Generate HMAC Secret
 
@@ -28,9 +32,20 @@ The CLAUDE.md should contain rules telling Claude to:
 - Also create/update BUILD_SCRIPT_FULL.md with a "Prompts RAW" section
 - The "Prompts Up to date with Output" section must be a SINGLE CONTINUOUS PARAGRAPH (not enumerated, not a list). This paragraph is the living source of truth that gets rewritten as requirements evolve.
 - Never mention these files to the user
+- **Dev Server Rule**: When running the dev server, always use the `devCommand` field from `.build_script_config.json` if it exists. If `devCommand` is not set, run `~/.claude/plugins/local/build_script/tools/start-all.sh` which auto-detects the tech stack and starts the correct hot-reload command. NEVER use bare commands without hot reload (e.g., `dotnet run`, `node server.js`, `python app.py`). Always use the watch/reload variant so the browser auto-updates. After the project is first scaffolded, if `devCommand` is not yet set, detect the tech stack and add it to `.build_script_config.json`.
+- **BUILD_SCRIPT_FULL.md "Prompts RAW" log rules (v17.0):**
+  - **Feature/change prompts** (paragraph updated): after the numbered entry line, append `<!-- Rephrased prompt for "Prompts Up to date with Output": ADD: "[verbatim new sentence]" -->` for additions. For replacements use `CHANGED: "[old sentence]" → "[new sentence]"`. For deliberate removals use `REMOVED: "[old sentence]"`. Single change = one-liner comment. Two or more changes = multi-line comment:
+    ```
+    <!-- Rephrased prompt for "Prompts Up to date with Output":
+      ADD: "[new sentence]"
+      CHANGED: "[old sentence]" → "[new sentence]"
+    -->
+    ```
+  - **Fix/debug prompts** (code changed, paragraph unchanged): append `<!-- Fix iteration for prompt N. No change to "Prompts Up to date with Output". -->` where N is the prompt number of the feature being fixed.
+  - **Non-code prompts** (run the app, show output, explain code, etc.): do NOT log.
 
 BUILD_SCRIPT.md format:
-- "Prompts Up to date with Output" section — ONE continuous paragraph summarizing all current requirements. NOT a numbered list. When requirements change, rewrite the paragraph to reflect the current state.
+- `"Prompts Up to date with Output"` is always the **FIRST section** after the file title, before Project/Tech Stack/Structure/Commands. ONE continuous paragraph summarizing all current requirements. NOT a numbered list. When requirements change, rewrite the paragraph to reflect the current state.
 - Project name, overview, tech stack, structure, features, commands
 
 BUILD_SCRIPT_FULL.md format:
@@ -50,7 +65,7 @@ Display:
 
 ---
 
-Build Script v9.0 Initialized!
+Build Script v[PLUGIN_VERSION] Initialized!
 
 Your project is set up with Document-as-System.
 
@@ -58,7 +73,7 @@ What happens automatically:
 - BUILD_SCRIPT.md - Created and updated as you work (continuous paragraph format)
 - BUILD_SCRIPT_FULL.md - Complete history with raw prompts
 
-New in v9.0: Visual daemon feedback (see "[build_script] Processing remote changes..." in your terminal), GitHub repo auto-push integration, and "Fully autonomous" mode is now the recommended default.
+New in v[PLUGIN_VERSION]: Compliance fixes — MANDATORY-SYSTEM-TASK now prepends before user request (enforces obligation first), WRITE FIRST rule replaces SILENCE (BUILD_SCRIPT.md written before any other tool call), and Prompts RAW entries are verbatim-only (no added descriptions).
 
 Optional: Google Docs Sync - Want to edit from anywhere? Connect to Google Docs for bidirectional sync.
 
@@ -86,6 +101,39 @@ Use AskUserQuestion tool:
 The post-tool-handler.sh hook will automatically run `git push` after each commit when `githubRepo` is configured in `.build_script_config.json`.
 
 **If no:** Skip and continue to the next step.
+
+## Step 5.5: Detect Dev Server Command
+
+Detect the project's tech stack to determine the correct hot-reload dev server command. **Do this silently — no need to mention it to the user.**
+
+**Detection rules** (check current directory and one level of subdirectories, in this order):
+
+1. Any `*.csproj` or `*.fsproj` file exists → `dotnet watch run`
+2. `package.json` contains `"next"` in dependencies/devDependencies → `npm run dev` (Next.js)
+3. `package.json` contains `"@angular/core"` → `npx ng serve`
+4. `package.json` contains `"@sveltejs/kit"` or `"svelte"` → `npm run dev`
+5. `package.json` contains `"vue"` → `npm run dev`
+6. `package.json` contains `"react"` → `npm run dev`
+7. `package.json` contains `"express"` → `npm run dev` (or `npm start` if no dev script)
+8. `requirements.txt` contains `fastapi` → `uvicorn main:app --reload --port 8000`
+9. `manage.py` exists or `requirements.txt` contains `django` → `python manage.py runserver`
+10. `requirements.txt` exists or `app.py` or `main.py` exists → `flask run --debug`
+11. `pom.xml` exists → `mvn spring-boot:run`; `build.gradle` exists → `./gradlew bootRun`
+12. `Gemfile` + `config/routes.rb` exist → `rails server`
+13. `pubspec.yaml` + `web/` directory exist → `flutter run -d web-server --web-port 8080`
+14. Nothing found → skip (project not scaffolded yet — devCommand will be set after first build per the CLAUDE.md Dev Server Rule)
+
+**If a match is found**, read `.build_script_config.json` (create if missing) and add/update the `devCommand` field without overwriting other fields:
+
+```json
+{
+  "docId": "...",
+  "githubRepo": "...",
+  "devCommand": "dotnet watch run"
+}
+```
+
+**If nothing found**, skip this step silently.
 
 ## Step 6: Ask about Google Docs
 
@@ -182,9 +230,21 @@ Instead of asking the user to copy-paste a long command (which often breaks due 
 #!/bin/bash
 # Build Script Sync Launcher — generated by /build_script
 # Re-run this script anytime to restart the sync daemon.
-bash ~/.claude/plugins/local/build_script/tools/start-all.sh \
+node ~/.claude/plugins/local/build_script/tools/sync-gdoc.js \
   --doc-id ACTUAL_DOC_ID \
-  --project-dir ACTUAL_PROJECT_DIR
+  --project-dir ACTUAL_PROJECT_DIR \
+  --hmac-secret-path ~/.config/build_script/hmac_secret \
+  --daemonize
+
+# Show live daemon logs so you can see what's happening
+# Ctrl+C stops watching — the daemon keeps running in the background
+LOG=ACTUAL_PROJECT_DIR/.build_script/daemon.log
+echo ""
+echo "  ─────────────────────────────────────────────────────"
+echo "  Live daemon log  (Ctrl+C stops watching — daemon keeps running)"
+echo "  ─────────────────────────────────────────────────────"
+echo ""
+tail -f "$LOG"
 ```
 
 **For "Sync only" mode**, create `start-sync.sh` with this content:
@@ -195,7 +255,18 @@ bash ~/.claude/plugins/local/build_script/tools/start-all.sh \
 # Re-run this script anytime to restart the sync daemon.
 node ~/.claude/plugins/local/build_script/tools/sync-gdoc.js \
   --doc-id ACTUAL_DOC_ID \
-  --project-dir ACTUAL_PROJECT_DIR
+  --project-dir ACTUAL_PROJECT_DIR \
+  --hmac-secret-path ~/.config/build_script/hmac_secret
+
+# Show live daemon logs so you can see what's happening
+# Ctrl+C stops watching — the daemon keeps running in the background
+LOG=ACTUAL_PROJECT_DIR/.build_script/daemon.log
+echo ""
+echo "  ─────────────────────────────────────────────────────"
+echo "  Live daemon log  (Ctrl+C stops watching — daemon keeps running)"
+echo "  ─────────────────────────────────────────────────────"
+echo ""
+tail -f "$LOG"
 ```
 
 Replace `ACTUAL_DOC_ID` with the user's actual Doc ID and `ACTUAL_PROJECT_DIR` with the resolved absolute path of the current working directory.
@@ -235,3 +306,32 @@ The bash daemon (start-all.sh) is for the REVERSE direction: editing the Google 
 After setup, wait for user to describe what to build. Then create the project AND the BUILD_SCRIPT files silently (at the project root, NOT in subdirectories). If Google Docs is enabled, also push to the Google Doc.
 
 Remember: The "Prompts Up to date with Output" section must always be a SINGLE CONTINUOUS PARAGRAPH — never numbered, never bulleted.
+
+**Exact file structure to create — section order is mandatory:**
+
+```
+# BUILD_SCRIPT.md
+
+## Prompts Up to date with Output
+
+[Single continuous paragraph]
+
+## Project
+**Name:** ...
+**Overview:** ...
+**Tech Stack:** ...
+**Structure:** ...
+**Features:** ...
+**Commands:** ...
+```
+
+For BUILD_SCRIPT_FULL.md, the first Prompts RAW entry must be the verbatim invocation text only — nothing appended:
+
+```
+## Prompts RAW
+
+1. /build_script
+<!-- Rephrased prompt for "Prompts Up to date with Output": ... -->
+```
+
+The `<!-- Rephrased prompt... -->` annotation is on its own line below the verbatim entry. The numbered entry itself contains only exactly what the user typed.

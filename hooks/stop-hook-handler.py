@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-stop-hook-handler.py — Stop hook for build_script v8.0.0
+stop-hook-handler.py — Stop hook for build_script v12.0.0
 
 Checks for queued Google Doc changes in .build_script_queue.json.
 If a valid, unconsumed queue exists, blocks Claude from stopping and

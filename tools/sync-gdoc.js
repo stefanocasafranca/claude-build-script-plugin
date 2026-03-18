@@ -1,9 +1,56 @@
 #!/usr/bin/env node
 /**
- * Google Docs Sync v9.0 — Visual PTY Feedback + GitHub Auto-Push
+ * Google Docs Sync v16.0 — Structured Log Format, Quality Gate Auto-Injection
  *
- * Writes an HMAC-signed queue file and triggers Claude Code via a three-tier
- * fallback chain to process Google Doc changes within ~11 seconds.
+ * v16.0 Changes from v15.0:
+ * - NEW: appendToFullLog() now appends <!-- Rephrased prompt for "Prompts Up to date
+ *   with Output": ADD: "..." | CHANGED: "old" → "new" --> comment on every GDocs entry.
+ * - NEW: buildInjectionPrompt() appends a quality gate HTML comment to every GDocs
+ *   injection so Claude verifies features end-to-end before finishing.
+ * - FIX: Rephrase inline annotation now uses HTML comment syntax (<!-- -->) instead of //
+ * - REFACTOR: formatComment() added to paragraph-diff.js; imported here.
+ *
+ * v15.0 Changes from v14.0:
+ * - FIX: Feedback loop eliminated: after a local→remote push (Claude's own write),
+ *   the paragraph baseline (.build_script_prev_paragraph.txt) is immediately
+ *   advanced. Prevents the daemon from seeing that Google Doc update as a user
+ *   edit and firing a second injection.
+ * - FIX: Prompt log deduplication: appendToFullLog() now detects rephrase/refinement
+ *   entries (within 2 min, >50% word overlap) and annotates the existing entry inline
+ *   instead of creating a new numbered entry in BUILD_SCRIPT_FULL.md.
+ * - FIX: Dev server auto-reload: SKILL.md now stores devCommand in
+ *   .build_script_config.json and adds a CLAUDE.md rule requiring the hot-reload
+ *   variant always. Non-technical users see browser auto-refresh.
+ *
+ * v14.0 Changes from v13.0:
+ * - FIX: start-sync.sh template now calls sync-gdoc.js directly (--daemonize)
+ *   instead of start-all.sh. Prevents hang on non-JS projects (e.g. .NET, Go,
+ *   Rust) where start-all.sh fell back to live-server and blocked indefinitely.
+ * - UX: start-sync.sh now tails daemon.log after spawning so the terminal shows
+ *   live activity instead of returning to a blank prompt.
+ *
+ * v13.0 Changes from v12.0:
+ * - FIX: TIOCSTI retry storm: attemptInjection() now marks delivered:true in
+ *   pending.json after first successful TIOCSTI call, then switches to
+ *   pollForConfirmation() (30s intervals) — never injects again. Retries
+ *   injection ONLY on actual TIOCSTI failure (exception thrown). Eliminates
+ *   the N×5s duplicate injection loop that caused up to 11 identical messages.
+ * - FIX: Multiple daemon instances: acquireDaemonLock() uses PID file +
+ *   process.kill(pid,0) liveness check. Kills existing daemon on startup.
+ *   Releases lock on SIGINT/SIGTERM/exit. Prevents two daemons from racing.
+ *
+ * v12.0 Changes from v11.0:
+ * - FIX: 429 rate-limit storm: readGoogleDocSafe() wraps readGoogleDoc() with
+ *   exponential backoff (5s → 10s → 20s → … → 120s max). Prevents hammering
+ *   the API after quota exhaustion.
+ * - FIX: Removed redundant extra readGoogleDoc() call at end of syncCycle()
+ *   when already in sync — was doubling API usage every poll.
+ * - FIX: Spurious full-paragraph injection on daemon resume: queuePromptForSession
+ *   now reads .build_script_prev_paragraph.txt as the comparison baseline instead
+ *   of re-extracting from the local file snapshot. Baseline is initialized from
+ *   the Google Doc on first startup, so restarts only inject genuine deltas.
+ * - FIX: osascript / System Events hang on macOS Sequoia moved to tiocsti_inject.py
+ *   (_macos_app_running now uses pgrep -x instead of AppleScript).
  *
  * v9.0 Changes from v8.1:
  * - CRITICAL FIX: PTY write to /dev/ttysNNN only displays text — it does NOT
@@ -46,7 +93,7 @@ const path = require('path');
 const https = require('https');
 
 const { sanitize, signQueue, rateLimit, auditLog, verifyNonceUniqueness, generateSecret, DEFAULT_SECRET_PATH } = require('./security');
-const { extractParagraph, diffParagraphs, formatDiffDetail } = require('./paragraph-diff');
+const { extractParagraph, diffParagraphs, formatDiffDetail, formatComment } = require('./paragraph-diff');
 
 function getArg(flag, fallback) {
   const i = process.argv.indexOf(flag);
@@ -81,7 +128,6 @@ const CONFIG = {
   hmacSecretPath: getArg('--hmac-secret-path', DEFAULT_SECRET_PATH),
   devPort: getArg('--dev-port', ''),
   tmuxPane: getArg('--tmux-pane', process.env.TMUX_PANE || ''),
-  noOsascript: process.argv.includes('--no-osascript'),
 };
 
 // v8.0: Record daemon's own PID/TTY for self-exclusion
@@ -89,6 +135,15 @@ const DAEMON_STATE = {
   pid: process.pid,
   tty: null, // resolved in main()
 };
+
+// v13.0: Daemon singleton lock file path
+const LOCK_FILE = path.join(CONFIG.projectDir, '.build_script', 'daemon.lock');
+
+// v13.0: Injection timing constants
+const INJECT_RETRY_INTERVAL_MS = 5000;  // retry failed injection every 5s
+const CONFIRM_POLL_INTERVAL_MS = 30000; // poll for confirmation every 30s
+const MAX_INJECT_RETRIES = 12;          // 12 × 5s = 60s max before fallback
+const MAX_CONFIRM_POLLS = 12;           // 12 × 30s = 6min max wait for confirmation
 
 if (!CONFIG.docId) {
   console.error('Error: Google Doc ID is required');
@@ -102,10 +157,19 @@ let isSyncing = false;
 let lastLocalHash = null;
 let lastRemoteHash = null;
 
+// v12.0: Exponential backoff state for 429 rate-limit recovery
+let consecutiveReadFailures = 0;
+let readBackoffUntil = 0;
+
 // Remote change debounce state
 let remoteChangeTimer = null;
 let pendingRemoteContent = null;
 let pendingPreviousContent = null;
+
+// v15.0: Rephrase detection state for appendToFullLog() deduplication.
+// Tracks the most recent full-log entry within this daemon session so rephrases
+// can be annotated inline instead of creating duplicate numbered entries.
+let lastFullLogEntry = { text: '', time: 0, num: 0 };
 
 function log(msg, level = 'info') {
   const ts = new Date().toISOString();
@@ -209,6 +273,28 @@ async function readGoogleDoc() {
   return text;
 }
 
+// v12.0: Wrap readGoogleDoc with exponential backoff on 429 (5s→10s→20s→…→120s)
+async function readGoogleDocSafe() {
+  if (Date.now() < readBackoffUntil) {
+    const remaining = Math.ceil((readBackoffUntil - Date.now()) / 1000);
+    throw new Error(`Rate-limit backoff active — ${remaining}s remaining`);
+  }
+  try {
+    const result = await readGoogleDoc();
+    consecutiveReadFailures = 0;
+    readBackoffUntil = 0;
+    return result;
+  } catch (e) {
+    if (e.message && e.message.includes('429')) {
+      consecutiveReadFailures++;
+      const backoffMs = Math.min(Math.pow(2, consecutiveReadFailures - 1) * 5000, 120000);
+      readBackoffUntil = Date.now() + backoffMs;
+      log(`Rate limit (429) — backoff ${Math.round(backoffMs / 1000)}s (failure #${consecutiveReadFailures})`, 'error');
+    }
+    throw e;
+  }
+}
+
 async function writeGoogleDoc(content) {
   if (!content || !content.trim()) {
     log('Skipping write: content is empty', 'sync');
@@ -266,6 +352,12 @@ function writeLocalFile(content) {
   fs.writeFileSync(path.join(CONFIG.projectDir, CONFIG.localFile), content);
 }
 
+// v12.0: Read persisted paragraph baseline — survives daemon restarts
+function readPrevParagraph() {
+  const p = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
+  try { return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() || null : null; } catch { return null; }
+}
+
 // ─── Prompts RAW reader ──────────────────────────────────────────────────────
 
 function readPromptsRaw() {
@@ -282,7 +374,153 @@ function readPromptsRaw() {
   }
 }
 
-// ─── Queue-based prompt injection (replaces triggerClaudeAgent) ──────────────
+// ─── v10.0: TIOCSTI-based injection ──────────────────────────────────────────
+
+/**
+ * Convert a sentence-level diff into a single coherent natural-language prompt.
+ * All three change types (added, removed, modified) are combined into one string
+ * that Claude can act on in a single response.
+ */
+function buildInjectionPrompt(diff) {
+  const parts = [];
+  for (const s of diff.added) {
+    parts.push(`Add: ${s}`);
+  }
+  for (const s of diff.removed) {
+    parts.push(`Remove: ${s}`);
+  }
+  for (const m of diff.modified) {
+    parts.push(`Update "${m.old}" -> "${m.new}"`);
+  }
+  return parts.join('. ');
+}
+
+/**
+ * Inject a prompt string into the given TTY's input buffer using TIOCSTI.
+ * Characters appear visibly in the Claude Code terminal as if typed by the user.
+ * Final \n fires Enter, causing Claude Code to process the prompt.
+ */
+function injectPromptViaTIOCSTI(ttyPath, promptText) {
+  const { execFileSync } = require('child_process');
+  const scriptPath = path.join(__dirname, 'tiocsti_inject.py');
+  execFileSync('python3', [scriptPath, ttyPath, promptText], {
+    timeout: 10000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
+/**
+ * v15.0: Jaccard word-overlap between two strings (case-insensitive).
+ * Returns a value in [0, 1]: 1 = identical word sets, 0 = no common words.
+ * Used by appendToFullLog() to detect rephrase/refinement entries.
+ */
+function wordOverlap(a, b) {
+  const words = s => new Set((s || '').toLowerCase().match(/\b\w+\b/g) || []);
+  const setA = words(a);
+  const setB = words(b);
+  if (setA.size === 0 && setB.size === 0) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let common = 0;
+  for (const w of setA) { if (setB.has(w)) common++; }
+  return common / Math.max(setA.size, setB.size);
+}
+
+/**
+ * Immediately append a raw entry to BUILD_SCRIPT_FULL.md.
+ * Called before injection so the record survives even if injection fails.
+ *
+ * v16.0: accepts diff to build the <!-- Rephrased prompt for "Prompts Up to date
+ * with Output": ADD: "..." --> annotation; rephrase inline annotation uses HTML
+ * comment syntax instead of //.
+ */
+function appendToFullLog(promptText, diff) {
+  const fullPath = path.join(CONFIG.projectDir, 'BUILD_SCRIPT_FULL.md');
+  try {
+    let content = '';
+    if (fs.existsSync(fullPath)) {
+      content = fs.readFileSync(fullPath, 'utf8');
+    }
+
+    const marker = '## Prompts RAW';
+
+    // v15.0: Rephrase detection — annotate last entry inline instead of creating
+    // a new numbered entry if the new prompt is semantically the same intent:
+    // condition: within 2 minutes AND >50% Jaccard word overlap.
+    if (
+      content.includes(marker) &&
+      lastFullLogEntry.num > 0 &&
+      lastFullLogEntry.text &&
+      Date.now() - lastFullLogEntry.time < 120_000
+    ) {
+      const overlap = wordOverlap(lastFullLogEntry.text, promptText);
+      if (overlap > 0.5) {
+        // Find the last numbered entry line and append annotation after it
+        const entryPrefix = `${lastFullLogEntry.num}. [GOOGLE DOCS]`;
+        const lastIdx = content.lastIndexOf(entryPrefix);
+        if (lastIdx !== -1) {
+          // v16.0: find end of the entry block (past any existing comment lines)
+          let blockEnd = content.indexOf('\n', lastIdx);
+          if (blockEnd !== -1) {
+            // Advance past any existing <!-- ... --> comment lines belonging to this entry
+            let nextNewline = content.indexOf('\n', blockEnd + 1);
+            while (nextNewline !== -1) {
+              const segment = content.substring(blockEnd + 1, nextNewline).trim();
+              if (segment.startsWith('<!--') || segment === '') {
+                blockEnd = nextNewline;
+                nextNewline = content.indexOf('\n', blockEnd + 1);
+              } else {
+                break;
+              }
+            }
+          }
+          const insertAt = blockEnd === -1 ? content.length : blockEnd;
+          // v16.0: use HTML comment syntax instead of //
+          const annotation = `\n<!-- BUILD_SCRIPT.md rephrased as: ${promptText} -->`;
+          content = content.substring(0, insertAt) + annotation + content.substring(insertAt);
+          fs.writeFileSync(fullPath, content, 'utf8');
+          log(`BUILD_SCRIPT_FULL.md: annotated entry #${lastFullLogEntry.num} as rephrase (overlap=${Math.round(overlap * 100)}%)`, 'queue');
+          lastFullLogEntry = { ...lastFullLogEntry, time: Date.now() };
+          return;
+        }
+      }
+    }
+
+    let nextNum = 1;
+
+    if (content.includes(marker)) {
+      const after = content.substring(content.indexOf(marker) + marker.length);
+      const entries = after.match(/^\d+\./gm);
+      if (entries && entries.length > 0) {
+        nextNum = entries.length + 1;
+      }
+    } else {
+      // Append the section header
+      content = content.trimEnd() + '\n\n## Prompts RAW\n';
+    }
+
+    // v16.0: build the rephrase comment from the diff
+    const comment = diff ? formatComment(diff) : '';
+    let rawEntry = `\n${nextNum}. [GOOGLE DOCS] ${promptText}`;
+    if (comment) {
+      rawEntry += `\n<!-- Rephrased prompt for "Prompts Up to date with Output": ${comment} -->`;
+    }
+
+    // Insert before or after marker
+    if (content.includes(marker)) {
+      content = content.trimEnd() + rawEntry + '\n';
+    } else {
+      content = content + rawEntry + '\n';
+    }
+
+    fs.writeFileSync(fullPath, content, 'utf8');
+    log(`BUILD_SCRIPT_FULL.md: appended entry #${nextNum}`, 'queue');
+    lastFullLogEntry = { text: promptText, time: Date.now(), num: nextNum };
+  } catch (e) {
+    log(`appendToFullLog error: ${e.message}`, 'error');
+  }
+}
+
+// ─── Queue-based prompt injection ────────────────────────────────────────────
 
 /**
  * Queue a prompt for the active Claude Code session.
@@ -293,8 +531,23 @@ function queuePromptForSession(previousContent, newContent) {
 
   const auditPath = path.join(CONFIG.projectDir, '.build_script_audit.log');
 
-  // Extract paragraphs and diff
-  const oldParagraph = extractParagraph(previousContent || '');
+  // v12.0: Use persisted baseline so daemon restarts don't re-inject already-processed changes.
+  // Falls back to extracting from the local file snapshot only when no baseline file exists.
+  const persistedPrev = readPrevParagraph();
+
+  if (persistedPrev === null && !previousContent) {
+    // First-ever run with no baseline: save Google Doc state as starting point, don't inject.
+    const initPara = extractParagraph(newContent || '');
+    if (initPara) {
+      try {
+        fs.writeFileSync(path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt'), initPara, 'utf8');
+        log('First-run: saved initial paragraph baseline — no injection', 'sync');
+      } catch {}
+    }
+    return;
+  }
+
+  const oldParagraph = persistedPrev !== null ? persistedPrev : extractParagraph(previousContent || '');
   const newParagraph = extractParagraph(newContent || '');
   const diff = diffParagraphs(oldParagraph, newParagraph);
 
@@ -313,53 +566,65 @@ function queuePromptForSession(previousContent, newContent) {
     return;
   }
 
-  // Build prompt data
-  const promptData = {
-    type: 'gdoc_diff',
-    summary: diff.summary,
-    previous_paragraph: sanitize(oldParagraph),
-    current_paragraph: sanitize(newParagraph),
-    diff_detail: sanitize(formatDiffDetail(diff)),
-    raw_prompts_context: sanitize(readPromptsRaw() || ''),
+  // v10.0: Build injection prompt covering ALL change types
+  // v16.0: base prompt is logged; quality gate is appended for Claude only
+  const basePrompt = buildInjectionPrompt(diff);
+  const injectionPrompt = basePrompt +
+    '\n\n<!-- Quality gate: Do not mark this complete until the feature is verified working end-to-end in the browser. Test it before finishing. -->';
+
+  // v10.0: Write BUILD_SCRIPT_FULL.md IMMEDIATELY before injection
+  // (record survives even if injection fails)
+  // v16.0: pass diff so the log entry gets the ADD:/CHANGED:/REMOVED: comment
+  appendToFullLog(basePrompt, diff);
+
+  // v10.0: Write pending state — baseline NOT advanced yet
+  // .build_script_prev_paragraph.txt still holds OLD content.
+  // On retry, diffParagraphs() will recompute the same diff from the unchanged baseline.
+  const nonce = require('crypto').randomBytes(16).toString('hex');
+  const pendingPath = path.join(CONFIG.projectDir, '.build_script_pending.json');
+  const pendingData = {
+    pending: true,
+    text: injectionPrompt,
+    nonce,
+    injected_at: Date.now(),
+    new_paragraph: newParagraph,
   };
-
-  // HMAC sign and write queue
   try {
-    const signedQueue = signQueue(promptData, CONFIG.hmacSecretPath);
-
-    // v7.0: Nonce replay protection — verify nonce hasn't been used before
-    if (!verifyNonceUniqueness(signedQueue.nonce, auditPath)) {
-      log('Duplicate nonce detected, skipping queue write', 'security');
-      auditLog(auditPath, { action: 'NONCE_REPLAY_BLOCKED', nonce: signedQueue.nonce });
-      return;
-    }
-
-    const queuePath = path.join(CONFIG.projectDir, '.build_script_queue.json');
-    fs.writeFileSync(queuePath, JSON.stringify(signedQueue, null, 2), { mode: 0o600 });
-
-    auditLog(auditPath, {
-      action: 'QUEUE_WRITE',
-      nonce: signedQueue.nonce,
-      len: JSON.stringify(promptData).length,
-      summary: diff.summary,
-    });
-
-    log(`Queued prompt for active session: ${diff.summary}`, 'queue');
-
-    // Save previous paragraph for next diff
-    const prevParagraphPath = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
-    fs.writeFileSync(prevParagraphPath, newParagraph);
-
-    // Trigger Claude Code to process the queue immediately
-    triggerSessionNudge();
-
+    fs.writeFileSync(pendingPath, JSON.stringify(pendingData, null, 2), { mode: 0o600 });
+    log(`Pending state written (nonce=${nonce.substring(0, 8)}...)`, 'queue');
   } catch (e) {
-    log(`Failed to queue prompt: ${e.message}`, 'error');
-    auditLog(auditPath, {
-      action: 'QUEUE_ERROR',
-      error: e.message,
-    });
+    log(`Failed to write pending state: ${e.message}`, 'error');
   }
+
+  // Also write HMAC-signed queue for backward compatibility with hook-based fallback
+  try {
+    const promptData = {
+      type: 'gdoc_diff',
+      summary: diff.summary,
+      previous_paragraph: sanitize(oldParagraph),
+      current_paragraph: sanitize(newParagraph),
+      diff_detail: sanitize(formatDiffDetail(diff)),
+      raw_prompts_context: sanitize(readPromptsRaw() || ''),
+    };
+    const signedQueue = signQueue(promptData, CONFIG.hmacSecretPath);
+    if (verifyNonceUniqueness(signedQueue.nonce, auditPath)) {
+      const queuePath = path.join(CONFIG.projectDir, '.build_script_queue.json');
+      fs.writeFileSync(queuePath, JSON.stringify(signedQueue, null, 2), { mode: 0o600 });
+      auditLog(auditPath, {
+        action: 'QUEUE_WRITE',
+        nonce: signedQueue.nonce,
+        len: JSON.stringify(promptData).length,
+        summary: diff.summary,
+      });
+    }
+  } catch (e) {
+    log(`Queue write error (non-fatal): ${e.message}`, 'error');
+  }
+
+  log(`Injection prompt: "${injectionPrompt.substring(0, 80)}..."`, 'queue');
+
+  // Attempt TIOCSTI injection with retry
+  attemptInjection(pendingPath, injectionPrompt);
 }
 
 // ─── v8.0: TTY discovery and AppleScript helpers ─────────────────────────────
@@ -449,220 +714,189 @@ function findClaudeTTY() {
   }
 }
 
+// ─── v13.0: Daemon singleton lock ────────────────────────────────────────────
+
 /**
- * Build AppleScript to target a Terminal.app tab by its TTY device.
- * Uses `key code 36` (Return) targeted at Terminal process instead of generic `keystroke return`.
+ * Release the daemon lock file if it belongs to this process.
  */
-function buildTerminalScriptByTTY(ttyPath) {
-  const ttyName = path.basename(ttyPath); // e.g. 'ttys005'
-  return [
-    'tell application "Terminal"',
-    '  set matched to false',
-    '  repeat with w in windows',
-    '    try',
-    '      repeat with t in tabs of w',
-    '        try',
-    `          if tty of t is "/dev/${ttyName}" then`,
-    '            set selected tab of w to t',
-    '            set frontmost of w to true',
-    '            delay 0.2',
-    '            tell application "System Events" to tell process "Terminal" to key code 36',
-    '            set matched to true',
-    '            exit repeat',
-    '          end if',
-    '        end try',
-    '      end repeat',
-    '    on error',
-    '      -- skip window with inaccessible tabs',
-    '    end try',
-    '    if matched then exit repeat',
-    '  end repeat',
-    '  if not matched then error "No tab with TTY ' + ttyName + '"',
-    'end tell',
-  ].join('\n');
+function releaseDaemonLock() {
+  try {
+    const content = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+    if (parseInt(content) === process.pid) {
+      fs.unlinkSync(LOCK_FILE);
+    }
+  } catch { /* already gone or unreadable */ }
 }
 
 /**
- * Build AppleScript to target a Terminal.app window by name, with daemon self-exclusion.
+ * Acquire exclusive daemon lock. If another instance is running, kill it first.
+ * Uses PID file + process.kill(pid, 0) liveness check — the lock is released
+ * automatically when the process exits (via exit/SIGINT/SIGTERM handlers).
  */
-function buildTerminalScriptByName(projectName) {
-  const daemonTTY = DAEMON_STATE.tty ? `/dev/${DAEMON_STATE.tty}` : '';
-  return [
-    'tell application "Terminal"',
-    '  set matched to false',
-    '  repeat with w in windows',
-    '    try',
-    '      repeat with t in tabs of w',
-    '        try',
-    `          if name of w contains "${projectName}" then`,
-    // Self-exclusion: skip tabs whose TTY matches the daemon
-    ...(daemonTTY ? [
-    `            if tty of t is not "${daemonTTY}" then`,
-    ] : []),
-    '              set selected tab of w to t',
-    '              set frontmost of w to true',
-    '              delay 0.2',
-    '              tell application "System Events" to tell process "Terminal" to key code 36',
-    '              set matched to true',
-    ...(daemonTTY ? [
-    '            end if',
-    ] : []),
-    '            exit repeat',
-    '          end if',
-    '        end try',
-    '      end repeat',
-    '    on error',
-    '      -- skip window with inaccessible tabs',
-    '    end try',
-    '    if matched then exit repeat',
-    '  end repeat',
-    '  if not matched then error "No matching window for ' + projectName + '"',
-    'end tell',
-  ].join('\n');
+function acquireDaemonLock() {
+  const lockDir = path.dirname(LOCK_FILE);
+  try { fs.mkdirSync(lockDir, { recursive: true }); } catch {}
+
+  if (fs.existsSync(LOCK_FILE)) {
+    let existingPid = null;
+    try { existingPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim()); } catch {}
+
+    if (existingPid && existingPid !== process.pid) {
+      let isRunning = false;
+      try { process.kill(existingPid, 0); isRunning = true; } catch {}
+
+      if (isRunning) {
+        log(`Existing daemon (PID ${existingPid}) found — sending SIGTERM`, 'info');
+        try { process.kill(existingPid, 'SIGTERM'); } catch {}
+        // Busy-wait up to 2s for old daemon to exit before overwriting lock
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+          try { process.kill(existingPid, 0); } catch { break; }
+          const t = Date.now() + 100; while (Date.now() < t) {} // 100ms spin
+        }
+      } else {
+        log(`Stale lock (PID ${existingPid} not running) — taking over`, 'info');
+      }
+    }
+  }
+
+  fs.writeFileSync(LOCK_FILE, String(process.pid), { mode: 0o600 });
+  log(`Daemon lock acquired (PID ${process.pid})`, 'info');
+}
+
+// ─── v13.0: TIOCSTI injection with delivery/confirmation separation ───────────
+
+/**
+ * Mark pending.json as delivered after successful TIOCSTI.
+ * Prevents re-injection even if the retry loop fires again.
+ */
+function markDelivered(pendingPath) {
+  try {
+    const pending = JSON.parse(fs.readFileSync(pendingPath, 'utf8'));
+    if (!pending.delivered) {
+      pending.delivered = true;
+      fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2), { mode: 0o600 });
+    }
+  } catch { /* non-fatal */ }
 }
 
 /**
- * Build AppleScript for iTerm2 with relaxed name matching.
+ * Poll pending.json for hook confirmation (pending:false).
+ * Called ONCE after successful TIOCSTI delivery. Advances baseline when confirmed.
+ * Never injects again — only waits.
  */
-function buildItermScript(projectName) {
-  return [
-    'tell application "iTerm2"',
-    '  set matched to false',
-    '  repeat with w in windows',
-    '    repeat with t in tabs of w',
-    '      repeat with s in sessions of t',
-    `        if name of s contains "${projectName}" or name of s contains "claude" then`,
-    '          select s',
-    '          tell s to write text ""',
-    '          set matched to true',
-    '          exit repeat',
-    '        end if',
-    '      end repeat',
-    '      if matched then exit repeat',
-    '    end repeat',
-    '    if matched then exit repeat',
-    '  end repeat',
-    '  if not matched then error "No matching session"',
-    'end tell',
-  ].join('\n');
+function pollForConfirmation(pendingPath, pollCount) {
+  pollCount = pollCount || 0;
+  setTimeout(() => {
+    let pending;
+    try {
+      pending = JSON.parse(fs.readFileSync(pendingPath, 'utf8'));
+    } catch {
+      return; // file gone — stop polling
+    }
+
+    if (!pending.pending) {
+      log('Injection confirmed by hook — advancing paragraph baseline', 'queue');
+      const prevParagraphPath = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
+      try { fs.writeFileSync(prevParagraphPath, pending.new_paragraph || ''); } catch {}
+      return;
+    }
+
+    if (pollCount < MAX_CONFIRM_POLLS) {
+      log(`Awaiting confirmation... poll ${pollCount + 1}/${MAX_CONFIRM_POLLS}`, 'queue');
+      pollForConfirmation(pendingPath, pollCount + 1);
+    } else {
+      // Timed out (6 min) — advance baseline anyway to prevent permanent stall
+      log('Confirmation timeout — advancing baseline to prevent stall', 'queue');
+      try {
+        const prevParagraphPath = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
+        fs.writeFileSync(prevParagraphPath, pending.new_paragraph || '');
+      } catch {}
+    }
+  }, CONFIRM_POLL_INTERVAL_MS);
 }
 
-// ─── v8.0: Three-tier session trigger ────────────────────────────────────────
-
 /**
- * v9.0: Trigger the Claude Code session to process the queue.
+ * v13.0: Attempt TIOCSTI injection with strict delivery/confirmation separation.
  *
- * Two-step approach:
- *   Step 1 — Visual feedback: write message to PTY slave (display only, not input)
- *   Step 2 — Input trigger: osascript sends real Enter keystroke via Accessibility API
- *            Fallbacks: TTY tab match → name match → iTerm2 → tmux → notification
- *
- * CRITICAL: PTY slave write (/dev/ttysNNN) only DISPLAYS text on the terminal.
- * It does NOT inject input into Claude Code's TUI. osascript is the actual trigger.
- *
- * Security: only sends a literal Enter. HMAC verification in the hook is the security gate.
+ * State machine:
+ *   pending:true, delivered:false → try to inject (retry on failure only)
+ *   pending:true, delivered:true  → already sent, poll for confirmation (no inject)
+ *   pending:false                 → confirmed, advance baseline, done
  */
-function triggerSessionNudge() {
-  const { execSync } = require('child_process');
-  const projectName = path.basename(CONFIG.projectDir);
-  const failures = [];
+function attemptInjection(pendingPath, promptText, retryCount) {
+  retryCount = retryCount || 0;
 
-  // ── Step 1: Visual feedback via PTY write (display only) ──
-  // IMPORTANT: Writing to PTY slave (/dev/ttysNNN) only DISPLAYS text on the
-  // terminal — it does NOT inject input into Claude Code's TUI. We use this
-  // purely for visual feedback, then ALWAYS proceed to osascript for actual
-  // input triggering.
+  // Read current pending state
+  let pending;
+  try {
+    pending = JSON.parse(fs.readFileSync(pendingPath, 'utf8'));
+  } catch {
+    return; // file gone — stop
+  }
+
+  // State: confirmed — advance baseline and stop
+  if (!pending.pending) {
+    log('Injection confirmed — advancing paragraph baseline', 'queue');
+    const prevParagraphPath = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
+    try { fs.writeFileSync(prevParagraphPath, pending.new_paragraph || ''); } catch {}
+    return;
+  }
+
+  // State: delivered but not yet confirmed — only poll, never inject again
+  if (pending.delivered) {
+    log('Injection already delivered — switching to confirmation polling', 'queue');
+    pollForConfirmation(pendingPath, 0);
+    return;
+  }
+
+  // State: not yet delivered — attempt TIOCSTI
   const claudeTTY = findClaudeTTY();
+
   if (claudeTTY) {
     try {
-      fs.writeFileSync(claudeTTY, '\x1b[33m[build_script]\x1b[0m Processing remote changes from Google Docs...\n');
-      log(`Visual feedback written to ${claudeTTY} (PTY display only)`, 'queue');
-    } catch (e) {
-      log(`Visual feedback failed for ${claudeTTY}: ${e.message}`, 'error');
-      // Non-fatal — continue to input trigger
-    }
-  }
+      injectPromptViaTIOCSTI(claudeTTY, promptText);
+      log(`[INJECT] TIOCSTI -> ${claudeTTY} (attempt ${retryCount + 1})`, 'queue');
 
-  // ── Step 2: Actual input trigger via osascript ──
-  // osascript sends a real Enter keystroke via Accessibility API, which Claude
-  // Code's TUI processes as user input, firing the UserPromptSubmit hook.
-  if (process.platform === 'darwin' && !CONFIG.noOsascript) {
-    // 2a: Terminal.app — TTY-based tab match (most reliable)
-    if (claudeTTY) {
-      try {
-        const script = buildTerminalScriptByTTY(claudeTTY);
-        execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
-          timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8'
-        });
-        log('Triggered Enter via osascript (TTY match) — queue should be consumed', 'queue');
-        return;
-      } catch (e) {
-        const stderr = e.stderr ? e.stderr.trim() : e.message;
-        failures.push(`osascript TTY match: ${stderr}`);
-      }
-    }
+      // Mark delivered immediately — no further injection attempts regardless of outcome
+      markDelivered(pendingPath);
 
-    // 2b: Terminal.app — name match with self-exclusion
-    try {
-      const script = buildTerminalScriptByName(projectName);
-      execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
-        timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8'
-      });
-      log('Triggered Enter via osascript (name match) — queue should be consumed', 'queue');
+      // Switch to confirmation polling (30s intervals, never injects again)
+      pollForConfirmation(pendingPath, 0);
       return;
     } catch (e) {
-      const stderr = e.stderr ? e.stderr.trim() : e.message;
-      failures.push(`osascript name match: ${stderr}`);
-    }
-
-    // 2c: iTerm2
-    try {
-      const script = buildItermScript(projectName);
-      execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
-        timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8'
-      });
-      log('Triggered Enter via osascript (iTerm2) — queue should be consumed', 'queue');
-      return;
-    } catch (e) {
-      const stderr = e.stderr ? e.stderr.trim() : e.message;
-      failures.push(`osascript iTerm2: ${stderr}`);
-    }
-  }
-
-  // ── Step 2 fallback: tmux send-keys ──
-  if (process.env.TMUX || CONFIG.tmuxPane) {
-    try {
-      const pane = CONFIG.tmuxPane || '';
-      if (pane) {
-        execSync(`tmux send-keys -t "${pane}" "" Enter`, {
-          timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']
-        });
-        log('Triggered Enter via tmux send-keys', 'queue');
-        return;
-      }
-    } catch (e) {
-      failures.push(`tmux: ${e.message}`);
-    }
-  }
-
-  // ── Step 3: macOS notification (last resort — user must press Enter manually) ──
-  if (process.platform === 'darwin') {
-    const diagParts = [`Daemon TTY: ${DAEMON_STATE.tty || 'unknown'}`];
-    if (failures.length > 0) {
-      diagParts.push(`Tried: ${failures.length} methods`);
-    }
-    const diagMsg = diagParts.join('. ');
-    try {
-      execSync(
-        `osascript -e 'display notification "Google Doc updated — press Enter in Claude Code. ${diagMsg}" with title "Build Script v9.0" sound name "Ping"'`,
-        { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
-      );
-      log(`Sent macOS notification (all auto-triggers failed). Failures: ${failures.join(' | ')}`, 'queue');
-    } catch (e) {
-      log(`All nudge methods failed. Failures: ${failures.join(' | ')}`, 'error');
+      log(`TIOCSTI failed (attempt ${retryCount + 1}): ${e.message}`, 'error');
     }
   } else {
-    log(`No nudge method available. Failures: ${failures.join(' | ')}`, 'error');
+    log(`Claude TTY not found (attempt ${retryCount + 1})`, 'error');
+  }
+
+  // Injection delivery failed — retry injection after 5s
+  if (retryCount < MAX_INJECT_RETRIES) {
+    log(`Retrying injection in 5s... (${retryCount + 1}/${MAX_INJECT_RETRIES})`, 'queue');
+    setTimeout(() => attemptInjection(pendingPath, promptText, retryCount + 1), INJECT_RETRY_INTERVAL_MS);
+  } else {
+    log('Max injection retries — fallback notification', 'error');
+    sendFallbackNotification();
+    // Still poll so baseline advances if user manually triggers Claude
+    pollForConfirmation(pendingPath, 0);
+  }
+}
+
+/**
+ * Send a macOS notification as last resort when TIOCSTI injection fails.
+ */
+function sendFallbackNotification() {
+  if (process.platform !== 'darwin') return;
+  try {
+    const { execSync } = require('child_process');
+    execSync(
+      `osascript -e 'display notification "Google Doc updated — press Enter in Claude Code" with title "Build Script v15.0" sound name "Ping"'`,
+      { timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    log('Sent macOS fallback notification', 'queue');
+  } catch (e) {
+    log(`Fallback notification failed: ${e.message}`, 'error');
   }
 }
 
@@ -699,7 +933,7 @@ async function syncCycle() {
     if (local === null) {
       log('BUILD_SCRIPT.md not found locally — checking Google Doc...', 'sync');
       try {
-        const remote = await readGoogleDoc();
+        const remote = await readGoogleDocSafe();
         if (remote && remote.trim()) {
           log('Found content in Google Doc — creating local BUILD_SCRIPT.md', 'sync');
           writeLocalFile(remote);
@@ -726,7 +960,7 @@ async function syncCycle() {
 
     let remote;
     try {
-      remote = await readGoogleDoc();
+      remote = await readGoogleDocSafe();
     } catch (e) {
       log(`Failed to read Google Doc: ${e.message}`, 'error');
       return;
@@ -750,6 +984,20 @@ async function syncCycle() {
       log('Local changed -> pushing to Google Doc', 'sync');
       await writeGoogleDoc(local);
       log('Pushed to Google Doc', 'success');
+      // v15.0: Advance paragraph baseline immediately after Claude's own local→remote push.
+      // Without this, the next sync cycle sees the Google Doc changed (it was our own push)
+      // and fires a second injection as if the user edited the doc — feedback loop.
+      // Advancing the baseline here tells queuePromptForSession() there is nothing new.
+      const prevParagraphPath = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
+      const currentParagraph = extractParagraph(local);
+      if (currentParagraph) {
+        try {
+          fs.writeFileSync(prevParagraphPath, currentParagraph, 'utf8');
+          log('Baseline advanced after local→remote sync (feedback loop prevented)', 'sync');
+        } catch (e) {
+          log(`Could not advance baseline: ${e.message}`, 'error');
+        }
+      }
     } else if (remoteChanged && !localChanged) {
       log('Google Doc changed -> updating local file', 'sync');
       const previousContent = local;
@@ -767,17 +1015,9 @@ async function syncCycle() {
       log('Initial sync complete', 'success');
     }
 
-    // Update tracking hashes
+    // Update tracking hashes (v12.0: no extra read when in sync — use already-known hash)
     lastLocalHash = contentHash(readLocalFile());
-    if (localH === remoteH) {
-      try {
-        lastRemoteHash = contentHash(await readGoogleDoc());
-      } catch {
-        lastRemoteHash = lastLocalHash;
-      }
-    } else {
-      lastRemoteHash = lastLocalHash;
-    }
+    lastRemoteHash = localH === remoteH ? remoteH : lastLocalHash;
 
   } catch (e) {
     log(`Sync error: ${e.message}`, 'error');
@@ -789,6 +1029,29 @@ async function syncCycle() {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // v11.0: Self-daemonize if --daemonize flag is passed and we're in a TTY
+  if (process.argv.includes('--daemonize') && process.stdin.isTTY) {
+    const daemonDir = path.join(CONFIG.projectDir, '.build_script');
+    fs.mkdirSync(daemonDir, { recursive: true });
+    const logFile = path.join(daemonDir, 'daemon.log');
+    const pidFile = path.join(daemonDir, 'daemon.pid');
+    const args = process.argv.slice(1).filter(a => a !== '--daemonize');
+    const logFd = fs.openSync(logFile, 'a');
+    const child = require('child_process').spawn(process.execPath, args, {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+    child.unref();
+    fs.writeFileSync(pidFile, String(child.pid));
+    console.log(`Build Script daemon running (PID ${child.pid})`);
+    console.log(`Logs:  tail -f ${logFile}`);
+    console.log(`Stop:  kill ${child.pid}  (or bash stop-sync.sh)`);
+    process.exit(0);
+  }
+
+  // v13.0: Acquire daemon singleton lock — kills any existing daemon first
+  acquireDaemonLock();
+
   // Ensure HMAC secret exists
   try {
     generateSecret(CONFIG.hmacSecretPath);
@@ -810,13 +1073,13 @@ async function main() {
     log(`Could not resolve daemon TTY: ${e.message}`, 'error');
   }
 
-  const triggerMethod = CONFIG.noOsascript ? 'notification only' :
-    process.platform === 'darwin' ? 'PTY write → osascript → notification' :
-    process.env.TMUX ? 'tmux send-keys' : 'notification only';
+  const triggerMethod = process.platform === 'darwin'
+    ? 'PTY TIOCSTI → paste (any terminal) → retry 5s'
+    : 'xdotool/ydotool → notification';
 
   console.log(`
 ============================================================
-  Google Docs Sync v9.0 — Visual Feedback + Auto-Trigger
+  Google Docs Sync v15.0 — Feedback-Loop Fix, Log Deduplication, Auto-Reload
 ============================================================
   Doc ID:      ${CONFIG.docId}
   Project:     ${CONFIG.projectDir}
@@ -841,7 +1104,7 @@ async function main() {
 
   // v6.0: Startup validation — verify doc is readable and save config
   try {
-    const docContent = await readGoogleDoc();
+    const docContent = await readGoogleDocSafe();
     const contentLen = docContent ? docContent.length : 0;
     log(`Doc validation: ${contentLen} chars, hash=${contentHash(docContent).substring(0,8)}`, 'success');
 
@@ -854,6 +1117,19 @@ async function main() {
     const configData = { docId: CONFIG.docId, projectDir: CONFIG.projectDir, updatedAt: new Date().toISOString() };
     fs.writeFileSync(configPath, JSON.stringify(configData, null, 2));
     log('Saved doc ID to .build_script_config.json', 'info');
+
+    // v12.0: Initialize paragraph baseline on first startup — prevents spurious full-paragraph
+    // injection when daemon resumes on a project that already has history.
+    const prevParaPath = path.join(CONFIG.projectDir, '.build_script_prev_paragraph.txt');
+    if (!fs.existsSync(prevParaPath) && docContent) {
+      const initPara = extractParagraph(docContent);
+      if (initPara) {
+        try {
+          fs.writeFileSync(prevParaPath, initPara, 'utf8');
+          log('Initialized paragraph baseline from Google Doc', 'info');
+        } catch {}
+      }
+    }
   } catch (e) {
     log(`WARNING: Could not validate doc on startup: ${e.message}`, 'error');
   }
@@ -877,5 +1153,8 @@ async function main() {
   log('Watching for changes... (remote edits will be queued for active session)', 'success');
 }
 
-process.on('SIGINT', () => { log('Shutting down...'); process.exit(0); });
+// v13.0: Release lock on all exit paths
+process.on('SIGINT', () => { releaseDaemonLock(); log('Shutting down...'); process.exit(0); });
+process.on('SIGTERM', () => { releaseDaemonLock(); log('Shutting down (SIGTERM)...'); process.exit(0); });
+process.on('exit', releaseDaemonLock);
 main();

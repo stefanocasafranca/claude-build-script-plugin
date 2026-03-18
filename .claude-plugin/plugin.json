@@ -1,5 +1,5 @@
 {
   "name": "build_script",
   "description": "Document-as-System: Automatically maintains BUILD_SCRIPT.md as you code. Optional Google Docs sync with instant same-session injection.",
-  "version": "9.0.0"
+  "version": "17.0.0"
 }

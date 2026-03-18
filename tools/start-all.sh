@@ -1,15 +1,17 @@
 #!/bin/bash
-# Autonomous Build Loop Launcher v7.0
+# Autonomous Build Loop Launcher v15.0
 # Starts: dev server + Google Docs sync (with instant prompt injection)
 # Auto-detects project type and launches the appropriate dev server.
 # Detects actual port from dev server stdout (framework-agnostic).
+# v15.0: Added .NET (dotnet watch run) detection.
 # v7.0: Terminal.app window-name fix, nonce replay protection, 1s default polling.
 # v6.0: osascript auto-trigger for instant injection on macOS.
 #        Writes HMAC-signed queue files and sends Enter keystroke to Claude Code session.
 #
 # Usage: bash start-all.sh --doc-id YOUR_DOC_ID [--project-dir /path] [--project-type TYPE]
-# Types: react-vite, nextjs, vue-vite, svelte-kit, angular, python-flask, python-fastapi,
-#        python-django, spring-boot, rails, flutter-web, express, static (auto-detected if omitted)
+# Types: dotnet, react-vite, nextjs, vue-vite, svelte-kit, angular, python-flask,
+#        python-fastapi, python-django, spring-boot, rails, flutter-web, express, static
+#        (auto-detected if omitted)
 
 PROJECT_DIR=""
 PROJECT_TYPE=""
@@ -48,6 +50,11 @@ cd "$PROJECT_DIR" || { echo "ERROR: Cannot cd to $PROJECT_DIR"; exit 1; }
 # Helper: detect project type from a directory containing project files
 detect_type_in_dir() {
   local dir="$1"
+  # .NET projects: any *.csproj or *.fsproj file
+  if ls "$dir"/*.csproj "$dir"/*.fsproj 2>/dev/null | grep -q .; then
+    echo "dotnet"
+    return
+  fi
   if [ -f "$dir/package.json" ]; then
     if grep -q '"next"' "$dir/package.json" 2>/dev/null; then
       echo "nextjs"
@@ -126,6 +133,11 @@ fi
 # ─── Dev server command + fallback port per project type ─────────────────────
 FALLBACK_PORT=""
 case "$PROJECT_TYPE" in
+  dotnet)
+    # Prefer dotnet watch run for hot-reload; fall back to dotnet run if watch unavailable
+    DEV_CMD="dotnet watch run"
+    FALLBACK_PORT=5000
+    ;;
   react-vite|vue-vite|svelte-kit|node-generic)
     DEV_CMD="npm run dev"
     FALLBACK_PORT=5173
@@ -251,7 +263,7 @@ fi
 HMAC_SECRET_PATH="$HOME/.config/build_script/hmac_secret"
 
 # Detect trigger method
-TRIGGER_INFO="  Trigger:      osascript (Terminal.app/iTerm2 auto-trigger)"
+TRIGGER_INFO="  Trigger:      TIOCSTI → clipboard paste (any terminal, macOS)"
 if [[ "$OSTYPE" != "darwin"* ]]; then
   if [ -n "$TMUX" ]; then
     TRIGGER_INFO="  Trigger:      tmux send-keys"
@@ -262,7 +274,7 @@ fi
 
 echo ""
 echo "============================================"
-echo "  Autonomous Build Loop v7.0"
+echo "  Autonomous Build Loop v15.0"
 echo "  Instant Prompt Injection"
 echo "============================================"
 echo "  Project Type: $PROJECT_TYPE"
@@ -282,10 +294,25 @@ fi
 PASSTHROUGH_ARGS+=("--dev-port" "$DEV_PORT")
 PASSTHROUGH_ARGS+=("--hmac-secret-path" "$HMAC_SECRET_PATH")
 
-# Start sync daemon in foreground (no more separate Claude agent)
-node "$SCRIPT_DIR/sync-gdoc.js" "${PASSTHROUGH_ARGS[@]}"
+# ─── Start sync daemon (detached background, no controlling terminal) ────────
+echo "  Starting sync daemon..."
+PID_FILE="$PROJECT_DIR/.build_script/daemon.pid"
 
-# Cleanup on exit
+if [[ " ${PASSTHROUGH_ARGS[*]} " =~ " --foreground " ]]; then
+  # Debug mode: run in foreground, logs go to this terminal
+  node "$SCRIPT_DIR/sync-gdoc.js" "${PASSTHROUGH_ARGS[@]}"
+else
+  # Normal mode: self-daemonize (no terminal window)
+  node "$SCRIPT_DIR/sync-gdoc.js" "${PASSTHROUGH_ARGS[@]}" --daemonize
+fi
+
+echo ""
+echo "  To stop: kill \$(cat $PID_FILE) 2>/dev/null || echo 'not running'"
+
+# Keep terminal open if a dev server is running (Ctrl+C to stop)
 if [ -n "$DEV_PID" ]; then
+  echo ""
+  echo "  Dev server running (PID $DEV_PID). Press Ctrl+C to stop."
+  wait $DEV_PID
   kill $DEV_PID 2>/dev/null
 fi
